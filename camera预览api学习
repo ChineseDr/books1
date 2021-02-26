@@ -1,0 +1,141 @@
+### 打开Camera
+
+本节我们主要研究打开相机的流程，考虑到api2主要通过设置回调的方式进行操作，我们会探究设置的回
+调是如何被调用的。 
+
+#### 1. native java流程 
+
+通过获取系统服务，即getSystemService(Context.CAMERA_SERVICE)的方式获取CameraManager，apk
+调用该类的openCamera方法打开相机，代码在CameraManager.java： 
+
+```java
+openCamera()==>openCameraForUid()==>openCameraDeviceUserAsync();
+```
+
+在连续2个函数调用后，调用openCameraDeviceUserAsync，
+
+```java
+openCameraDeviceUserAsync(){
+  /*①*/ICameraService cameraService = CameraManagerGlobal.get().getCameraService();
+  /*②*/cameraUser = cameraService.connectDevice(callbacks, cameraId,mContext.getOpPackageName(), uid);
+  /*③*/deviceImpl.setRemoteDevice(cameraUser);
+  device = deviceImpl;
+  return device;
+}
+```
+
+①这里首先关注ICameraService，它是通过AIDL获取的native C++层的CameraService对象，代码在
+CameraManager.java
+
+```java
+public ICameraService getCameraService()==>connectCameraServiceLocked(){cameraServiceBinder.linkToDeath(this, /*flags*/ 0);}
+```
+
+这里对于native java而言，通过linkToDeath获得了远端CameraService的代理对象。
+
+②下一步，通过ICameraService.connectDevice获取ICameraDeviceUser，它定义在ICameraService.aidl
+中。 
+
+③最后，通过CameraDeviceImpl.setRemoteDevice将java层的相机对象与远端的相机对象进行连接，代码
+如下： 
+
+```java
+CameraDeviceImpl.setRemoteDevice(){
+  remoteDeviceBinder.linkToDeath(this, /*flag*/ 0);
+  mDeviceHandler.post(mCallOnOpened);
+  mDeviceHandler.post(mCallOnUnconfigured);
+}
+```
+
+这里仍然通过linkToDeath获得远端CameraDevice的代理对象，在连接成功后，回调mCallOnOpened通
+知上层，相机已经打开。
+
+```jav
+private final Runnable mCallOnOpened;
+```
+
+
+
+这里的mDeviceCallback就是我们在openCamera时传入的CameraDevice.StateCallback，初始化等逻辑
+比较简单。
+这几步AIDL相关分析见下面的native C++层分析 
+
+#### 2. native C++
+
+首先分析前面提到的AIDL调用
+
+以ICameraService为例进行说明。
+server端：系统启动执行cameraserver.rc -> main_cameraserver.cpp的main方法
+
+```c++
+main(){CameraService::instantiate();}
+```
+
+CameraService继承了BinderService.cpp这个模板类，调用它的instantiate就是调用父类的instantiate方法
+
+```C++
+instantiate()==>publish()==>addService()
+```
+
+通过publish方法注册了对应的service，其名字由子类的getServiceName方法定义，CameraService定义在
+CameraService.h中 
+
+```c++
+static char const* getServiceName() { return "media.camera"; }
+```
+
+至此，server端的服务注册成功。
+AIDL：定义在ICameraService.aidl中，定义了client端所需要的能力，比如上面java侧调用的connectDevice方法。
+Client端：以上所示，通过调用ServiceManager.getService(CAMERA_SERVICE_BINDER_NAME)和
+linkToDeath获取对应的服务，可以看到service名字的定义在CameraManager的内部类
+CameraManagerGlobal中，是和server端名字吻合的
+
+```java
+private static final String CAMERA_SERVICE_BINDER_NAME = "media.camera";
+```
+
+回顾②，在获取CameraService后，调用connectDevice获取ICameraDeviceUser，代码在
+CameraService.cpp
+
+```C++
+CameraService::connectDevice(){
+  ret = connectHelper<hardware::camera2::ICameraDeviceCallbacks,CameraDeviceClient>();
+}
+```
+
+可以看到我们常见的日志CameraService::connectDevice E，这里E表示打开相机，是Enter的首字母。
+随后调用connectHelper打开相机
+
+```java
+CameraService::connectHelper()
+```
+
+此函数进行了很多的检查，比如我们常见的相机被占用，日志为
+CameraService::connect (PID %d) rejected (too many other clients connecting) 
+
+在连接过程中，首先调用makeClient
+
+```java
+CameraService::makeClient(){*client = new CameraDeviceClient()}
+```
+
+根据hal版本，创建了CameraDeviceClient返回给上一级，根据前面分析的，对于
+ICameraDeviceUser，其在native C++层对应的类就是CameraDeviceClient，它是native C++层提供给
+java层的远端代理，构造逻辑如下：CameraDeviceClient() -> Camera2ClientBase() -> new
+Camera3Device()
+这里通过连续的构造引出了native C++层的核心类，Camera3Device，暂且记下。
+
+```c++
+CameraDeviceClient::initialize()==> CameraDeviceClient::initializeImpl()==>Camera2ClientBase::initialize()
+```
+
+ CameraDeviceClient继承自Camera2ClientBase，调用Camera2ClientBase的initialize，代码在Camera2ClientBase.cpp 
+
+```c++
+Camera2ClientBase::initialize()==> Camera2ClientBase<TClientBase>::initializeImpl(){
+  res = mDevice->initialize(providerPtr, monitorTags);
+}
+```
+
+在这里最终调到了前述的核心类，Camera3Device的initialize方法，代码在Camera3Device.cpp
+
